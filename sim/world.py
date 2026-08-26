@@ -35,6 +35,17 @@ class WorldConfig:
     cam_pitch: float = -30.0
     cam_target: tuple[float, float, float] = (0.0, 0.0, 0.3)
 
+    # Disable PyBullet's default mouse picking (left-click drag applies
+    # a physical constraint to whatever body you click on). Great for
+    # ad-hoc debugging, terrible for interactive control demos where
+    # POSITION_CONTROL should be the only thing moving the arm.
+    disable_mouse_picking: bool = True
+
+    # Hide PyBullet's debug UI overlays (param sliders, axis widget).
+    # Default False because interactive checkpoints need sliders visible.
+    # Set True for headless-ish demos where the UI is just clutter.
+    hide_gui_panels: bool = False
+
 
 @dataclass
 class _Callback:
@@ -96,9 +107,14 @@ class World:
                 cameraTargetPosition=self.cfg.cam_target,
                 physicsClientId=self.client_id,
             )
-            # Turn off the GUI panels that clutter the view; keep the render.
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0,
-                                       physicsClientId=self.client_id)
+            # Optionally hide the GUI panels (param sliders, axis widget).
+            # Off by default so interactive checkpoints can show sliders.
+            if self.cfg.hide_gui_panels:
+                p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0,
+                                           physicsClientId=self.client_id)
+            if self.cfg.disable_mouse_picking:
+                p.configureDebugVisualizer(p.COV_ENABLE_MOUSE_PICKING, 0,
+                                           physicsClientId=self.client_id)
 
         self._step_count = 0
         # Reset callback schedule so a re-run starts clean.
