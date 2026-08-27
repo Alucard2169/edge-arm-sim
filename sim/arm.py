@@ -60,6 +60,10 @@ class ArmConfig:
     # position control after step-in.
     snap_to_home: bool = True
 
+    # Whether to attach a parallel-jaw gripper to the arm's ee link.
+    # When True, Arm.reset() also creates a Gripper (see sim/gripper.py).
+    with_gripper: bool = True
+
     def __post_init__(self) -> None:
         if len(self.home_pose_rad) != XARM6_NUM_JOINTS:
             raise ValueError(
@@ -100,6 +104,9 @@ class Arm:
         self._target_q: np.ndarray = np.array(self.cfg.home_pose_rad,
                                               dtype=np.float64)
 
+        # Populated by reset() if cfg.with_gripper=True.
+        self.gripper = None  # type: ignore[assignment]
+
     # ------------------------------------------------------------- lifecycle
 
     def reset(self) -> None:
@@ -137,6 +144,13 @@ class Arm:
         # Whether we snapped or not, register the control target so
         # POSITION_CONTROL holds the pose against gravity.
         self._apply_target()
+
+        # Spawn the gripper AFTER the arm is homed, so the gripper loads
+        # at the correct ee pose from the start.
+        if self.cfg.with_gripper:
+            from sim.gripper import Gripper, GripperConfig  # local import to avoid cycle
+            self.gripper = Gripper(self.world, self, GripperConfig())
+            self.gripper.reset()
 
     def _discover_joints(self) -> None:
         """Walk the loaded body's joints and record the 6 revolute ones.
@@ -236,3 +250,76 @@ class Arm:
         pos = np.array(state[4], dtype=np.float64)   # linkWorldPosition
         orn = np.array(state[5], dtype=np.float64)   # linkWorldOrientation
         return pos, orn
+
+    # ------------------------------------------------------------------- IK
+
+    def solve_ik(
+        self,
+        target_pos: Sequence[float],
+        target_orn: Sequence[float] | None = None,
+        max_iterations: int = 50,
+        residual_threshold: float = 1e-4,
+    ) -> np.ndarray:
+        """Damped-least-squares IK for the tool link.
+
+        Args:
+            target_pos: (x, y, z) in world frame.
+            target_orn: (qx, qy, qz, qw) in world frame, or None for
+                position-only IK (solver picks orientation freely).
+            max_iterations, residual_threshold: passed to PyBullet.
+
+        Returns:
+            Array of 6 target joint angles, already clipped to limits.
+
+        Notes:
+            PyBullet's IK returns one value per joint in the body,
+            including fixed joints. We slice out the 6 revolute ones.
+
+            We feed joint limits + a rest pose to the solver. Without
+            this, damped LS on a 6-DOF arm produces contorted solutions
+            (elbow flipped, wrist wrapped). With it, solutions stay
+            near the home pose, which is what a control loop expects.
+        """
+        target_pos = list(target_pos)
+
+        # Rest pose = current target. Keeps successive IK calls smooth
+        # (each solve starts near the last commanded pose).
+        rest_pose = self._target_q.tolist()
+
+        # joint_ranges is upper - lower per joint; standard PyBullet idiom.
+        lowers = self.joint_limits_lower.tolist()
+        uppers = self.joint_limits_upper.tolist()
+        ranges = (self.joint_limits_upper - self.joint_limits_lower).tolist()
+
+        common_kwargs = dict(
+            bodyUniqueId=self.body_id,
+            endEffectorLinkIndex=self.ee_link_index,
+            targetPosition=target_pos,
+            lowerLimits=lowers,
+            upperLimits=uppers,
+            jointRanges=ranges,
+            restPoses=rest_pose,
+            maxNumIterations=max_iterations,
+            residualThreshold=residual_threshold,
+            physicsClientId=self.world.client_id,
+        )
+        if target_orn is not None:
+            common_kwargs["targetOrientation"] = list(target_orn)
+
+        raw = p.calculateInverseKinematics(**common_kwargs)
+
+        # `raw` has one entry per joint in the body. Our 6 revolute
+        # joints appear in the order we discovered them; PyBullet's IK
+        # returns them in the same order (joints are enumerated by
+        # index, and non-fixed joints appear in that order in the IK
+        # output). Extract the first 6 — for xArm 6 the body has
+        # exactly 6 non-fixed joints, so raw is already length 6.
+        q = np.asarray(raw, dtype=np.float64)
+        if q.shape != (XARM6_NUM_JOINTS,):
+            # Defensive fallback: if the URDF ever gains extra movable
+            # joints (e.g. a gripper), take just the arm joints by
+            # position among non-fixed joints. For now this branch is
+            # unreachable with the bundled URDF.
+            q = q[:XARM6_NUM_JOINTS]
+
+        return np.clip(q, self.joint_limits_lower, self.joint_limits_upper)

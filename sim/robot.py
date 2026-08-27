@@ -1,4 +1,4 @@
-"""Composite of AGV + Arm: the mobile manipulator.
+u"""Composite of AGV + Arm: the mobile manipulator.
 
 The AGV is kinematic (pose set directly each tick), so the arm mounted
 on top gets the same treatment — we read the AGV's top-centre pose and
@@ -92,11 +92,17 @@ class Robot:
         Order per tick:
             1. AGV control step (advance patrol)
             2. Teleport arm base to new AGV top-centre
-            3. Arm control step (re-apply POSITION_CONTROL target)
+            3. Teleport gripper to new arm ee pose (if gripper exists)
+            4. Arm control step (re-apply POSITION_CONTROL target)
+            5. Gripper control step (re-apply finger POSITION_CONTROL)
         """
         self.agv.control_step(sim_time_s)
         self._teleport_arm_to_agv()
+        if self.arm.gripper is not None:
+            self.arm.gripper.teleport_to_arm_ee()
         self.arm.control_step(sim_time_s)
+        if self.arm.gripper is not None:
+            self.arm.gripper.control_step(sim_time_s)
 
     # -------------------------------------------------------------- mount
 

@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+<!--
+    Simple parallel-jaw gripper for edge-arm-sim.
+
+    Frame convention:
+        +z (base local) = tool axis; fingers extend in +z, tips at z ≈ 0.07 m
+        +x (base local) = finger-opening axis; fingers move symmetrically in ±x
+        origin is the mount point that attaches to the arm's ee link
+
+    Opening: each finger joint at 0 = closed (fingertips touch),
+             at max limit (0.03) = 6 cm wide (finger inner faces at ±0.03 m in x).
+
+    Kept intentionally lightweight (finger mass 10 g) so the arm's
+    POSITION_CONTROL doesn't have to fight the gripper inertia during
+    fast moves.
+-->
+<robot name="simple_gripper">
+
+    <!-- Palm: attaches to arm ee link -->
+    <link name="base">
+        <inertial>
+            <origin xyz="0 0 0"/>
+            <mass value="0.05"/>
+            <inertia ixx="1e-5" ixy="0" ixz="0" iyy="1e-5" iyz="0" izz="1e-5"/>
+        </inertial>
+        <visual>
+            <geometry>
+                <box size="0.08 0.04 0.02"/>
+            </geometry>
+            <material name="palm_grey">
+                <color rgba="0.25 0.25 0.30 1"/>
+            </material>
+        </visual>
+        <collision>
+            <geometry>
+                <box size="0.08 0.04 0.02"/>
+            </geometry>
+        </collision>
+    </link>
+
+    <!-- Left finger -->
+    <link name="finger_l">
+        <inertial>
+            <origin xyz="0 0 0.03"/>
+            <mass value="0.01"/>
+            <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+        </inertial>
+        <visual>
+            <origin xyz="0 0 0.03"/>
+            <geometry>
+                <box size="0.008 0.025 0.06"/>
+            </geometry>
+            <material name="finger_grey">
+                <color rgba="0.15 0.15 0.15 1"/>
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0.03"/>
+            <geometry>
+                <box size="0.008 0.025 0.06"/>
+            </geometry>
+        </collision>
+    </link>
+
+    <!-- Right finger -->
+    <link name="finger_r">
+        <inertial>
+            <origin xyz="0 0 0.03"/>
+            <mass value="0.01"/>
+            <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+        </inertial>
+        <visual>
+            <origin xyz="0 0 0.03"/>
+            <geometry>
+                <box size="0.008 0.025 0.06"/>
+            </geometry>
+            <material name="finger_grey">
+                <color rgba="0.15 0.15 0.15 1"/>
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0.03"/>
+            <geometry>
+                <box size="0.008 0.025 0.06"/>
+            </geometry>
+        </collision>
+    </link>
+
+    <!-- Left finger prismatic joint: 0 = closed (finger inner face at +0.004 in x),
+         0.03 = open (finger inner face at +0.034 in x). -->
+    <joint name="finger_l_joint" type="prismatic">
+        <parent link="base"/>
+        <child link="finger_l"/>
+        <origin xyz="0.004 0 0.01" rpy="0 0 0"/>
+        <axis xyz="1 0 0"/>
+        <limit lower="0.0" upper="0.03" effort="20" velocity="0.5"/>
+    </joint>
+
+    <!-- Right finger prismatic joint: symmetric, moves in -x. -->
+    <joint name="finger_r_joint" type="prismatic">
+        <parent link="base"/>
+        <child link="finger_r"/>
+        <origin xyz="-0.004 0 0.01" rpy="0 0 0"/>
+        <axis xyz="-1 0 0"/>
+        <limit lower="0.0" upper="0.03" effort="20" velocity="0.5"/>
+    </joint>
+
+</robot>
