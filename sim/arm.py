@@ -49,11 +49,32 @@ class ArmConfig:
 
     home_pose_rad: tuple[float, ...] = DEFAULT_HOME_POSE_RAD
 
-    # POSITION_CONTROL parameters. Defaults match what pybullet's
-    # own examples use for the xArm; tune per-joint later if needed.
-    max_force: float = 100.0
-    position_gain: float = 0.03
-    velocity_gain: float = 1.0
+    # POSITION_CONTROL parameters. Used only when kinematic_control=False.
+    max_force: float = 500.0
+    position_gain: float = 1.0
+    velocity_gain: float = 2.0
+
+    # Kinematic control mode. When True (default), control_step teleports
+    # joints toward the commanded target at bounded velocity via
+    # resetJointState — no PD tuning, guaranteed convergence, no fight
+    # with gravity. Consistent with the kinematic AGV and kinematic
+    # gripper-mount pattern already used elsewhere in the sim. The
+    # thesis's research question is about D(t) offloading decisions,
+    # not arm joint dynamics, so this is the right level of abstraction.
+    #
+    # Trade-off: the arm can push through dynamic objects (kinematic
+    # bodies ignore contact response). Grasping still works because
+    # fingers use POSITION_CONTROL (dynamic) and object hold is enforced
+    # via a fixed constraint set by GraspCycle during CLOSE.
+    kinematic_control: bool = True
+    # Max joint velocity when advancing kinematically (rad/s). At 30 Hz
+    # control this means ~4° per tick, so a 60° motion takes ~0.5 s.
+    max_joint_velocity_rps: float = 2.0
+    # Force used to lock joint velocity to zero between kinematic
+    # advances. Needs to be higher than any gravity torque the arm
+    # experiences — 500 Nm is well above xArm 6's rated joint torques
+    # (~50 Nm on strongest joints).
+    kinematic_lock_force: float = 500.0
 
     # If True, use resetJointState (teleport) on reset() to snap to home
     # before the sim starts stepping. If False, home is reached under
@@ -141,9 +162,24 @@ class Arm:
                 p.resetJointState(self.body_id, idx, q,
                                   physicsClientId=self.world.client_id)
 
-        # Whether we snapped or not, register the control target so
-        # POSITION_CONTROL holds the pose against gravity.
-        self._apply_target()
+        # Whether we snapped or not, hand off control to the appropriate
+        # controller. In POSITION_CONTROL mode we send the home target
+        # so the arm holds against gravity. In kinematic mode we set the
+        # motors to a VELOCITY_CONTROL lock (target vel=0 with strong
+        # force). Combined with resetJointState each control tick, this
+        # is what keeps joints at commanded positions: physics tries to
+        # move them (gravity), motor brakes them back.
+        #
+        # Setting force=0 (as an earlier version did) frees the motors
+        # entirely — bounded joints hit their limits, but unbounded ones
+        # (wrist rotations, joints 4 & 6) spin under gravity. Verified
+        # by scripts/debug_arm_hold.py: with force=0, joint6 drifted
+        # to -211° in 7 seconds; joints 1-3,5 with tighter limits held
+        # correctly. Strong VELOCITY_CONTROL fixes it uniformly.
+        if self.cfg.kinematic_control:
+            self._enable_kinematic_lock()
+        else:
+            self._apply_target()
 
         # Spawn the gripper AFTER the arm is homed, so the gripper loads
         # at the correct ee pose from the start.
@@ -151,6 +187,20 @@ class Arm:
             from sim.gripper import Gripper, GripperConfig  # local import to avoid cycle
             self.gripper = Gripper(self.world, self, GripperConfig())
             self.gripper.reset()
+
+    def _enable_kinematic_lock(self) -> None:
+        """Configure joint motors as a velocity-zero brake. Each motor
+        applies torque up to `kinematic_lock_force` to keep the joint's
+        velocity at zero — this cancels out gravity-induced motion
+        between resetJointState calls in _kinematic_advance."""
+        p.setJointMotorControlArray(
+            bodyUniqueId=self.body_id,
+            jointIndices=self.joint_indices,
+            controlMode=p.VELOCITY_CONTROL,
+            targetVelocities=[0.0] * XARM6_NUM_JOINTS,
+            forces=[self.cfg.kinematic_lock_force] * XARM6_NUM_JOINTS,
+            physicsClientId=self.world.client_id,
+        )
 
     def _discover_joints(self) -> None:
         """Walk the loaded body's joints and record the 6 revolute ones.
@@ -194,8 +244,13 @@ class Arm:
     # --------------------------------------------------------------- control
 
     def set_joint_positions(self, q: Sequence[float]) -> None:
-        """Set the position-control target. Takes effect on the next
-        control_step(). Values are clipped to joint limits."""
+        """Set the joint target. Takes effect on the next control_step().
+        Values are clipped to joint limits.
+
+        In POSITION_CONTROL mode, immediately pushes the target to the
+        controller so callers who don't drive a control loop still see
+        motion. In kinematic mode, we skip the immediate apply — the
+        next kinematic_advance() will handle it."""
         q_arr = np.asarray(q, dtype=np.float64)
         if q_arr.shape != (XARM6_NUM_JOINTS,):
             raise ValueError(
@@ -204,20 +259,43 @@ class Arm:
         self._target_q = np.clip(q_arr,
                                  self.joint_limits_lower,
                                  self.joint_limits_upper)
-        # Push to the controller immediately so callers who don't drive
-        # a control loop still see motion.
-        self._apply_target()
+        if not self.cfg.kinematic_control:
+            self._apply_target()
 
     def go_home(self) -> None:
         """Command the home pose as the current target."""
         self.set_joint_positions(self.cfg.home_pose_rad)
 
     def control_step(self, sim_time_s: float) -> None:
-        """Callback for World.register_callback(). Re-applies the current
-        joint target every tick. Explicit re-application is cheap and
-        protects against the target being cleared by resets or external
-        code."""
-        self._apply_target()
+        """Callback for World.register_callback(). Advances joints toward
+        the current target, either kinematically (default) or via
+        POSITION_CONTROL depending on cfg.kinematic_control."""
+        if self.cfg.kinematic_control:
+            self._kinematic_advance()
+        else:
+            self._apply_target()
+
+    def _kinematic_advance(self) -> None:
+        """Move each joint toward its target by at most max_step per tick,
+        via resetJointState with zero velocity. Guarantees convergence,
+        no gain tuning, no gravity to fight."""
+        # Estimate control tick rate from the world. Callback runs at
+        # whatever rate the caller registered; we approximate 30 Hz here
+        # for the step-size calculation. Slightly conservative is fine.
+        max_step = self.cfg.max_joint_velocity_rps / 30.0
+
+        q_actual = self.get_joint_positions()
+        q_delta = self._target_q - q_actual
+        q_step = np.clip(q_delta, -max_step, max_step)
+        q_new = q_actual + q_step
+
+        for idx, val in zip(self.joint_indices, q_new):
+            p.resetJointState(
+                self.body_id, idx,
+                targetValue=float(val),
+                targetVelocity=0.0,
+                physicsClientId=self.world.client_id,
+            )
 
     def _apply_target(self) -> None:
         p.setJointMotorControlArray(

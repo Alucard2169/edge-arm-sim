@@ -33,6 +33,11 @@ class Waypoint:
 
     xy: tuple[float, float]      # world-frame ground position
     dwell_s: float = 0.0         # seconds to hold still after arriving
+    # If set, AGV rotates to face this world-frame xy point on arrival
+    # (and also on reset() if this is the start waypoint). Overrides the
+    # default "face the next patrol waypoint" behaviour. Use this so the
+    # arm ends up pointing at whatever it's supposed to interact with.
+    face_xy: tuple[float, float] | None = None
 
 
 @dataclass
@@ -132,8 +137,17 @@ class AGV:
         # directly with resetBasePositionAndOrientation each tick and
         # PyBullet won't apply gravity or momentum to it.
         wp0 = self.cfg.waypoints[self.cfg.start_wp]
-        wp1 = self.cfg.waypoints[(self.cfg.start_wp + 1) % len(self.cfg.waypoints)]
-        start_yaw = math.atan2(wp1.xy[1] - wp0.xy[1], wp1.xy[0] - wp0.xy[0])
+        if wp0.face_xy is not None:
+            start_yaw = math.atan2(
+                wp0.face_xy[1] - wp0.xy[1], wp0.face_xy[0] - wp0.xy[0],
+            )
+        else:
+            wp1 = self.cfg.waypoints[
+                (self.cfg.start_wp + 1) % len(self.cfg.waypoints)
+            ]
+            start_yaw = math.atan2(
+                wp1.xy[1] - wp0.xy[1], wp1.xy[0] - wp0.xy[0],
+            )
         start_orn = p.getQuaternionFromEuler([0.0, 0.0, start_yaw])
 
         self.body_id = p.createMultiBody(
@@ -198,7 +212,14 @@ class AGV:
 
         if remaining <= distance:
             # Arrive at the next waypoint.
-            self._set_pose(target_xy, self._yaw_toward(target_xy, cur_xy))
+            if next_wp.face_xy is not None:
+                arrival_yaw = math.atan2(
+                    next_wp.face_xy[1] - target_xy[1],
+                    next_wp.face_xy[0] - target_xy[0],
+                )
+            else:
+                arrival_yaw = self._yaw_toward(target_xy, cur_xy)
+            self._set_pose(target_xy, arrival_yaw)
             self._current_wp = (self._current_wp + 1) % n
             self._dwell_remaining = next_wp.dwell_s
             return
