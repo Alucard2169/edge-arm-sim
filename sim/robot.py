@@ -1,4 +1,4 @@
-u"""Composite of AGV + Arm: the mobile manipulator.
+"""Composite of AGV + Arm: the mobile manipulator.
 
 The AGV is kinematic (pose set directly each tick), so the arm mounted
 on top gets the same treatment — we read the AGV's top-centre pose and
@@ -89,19 +89,24 @@ class Robot:
     def step_callback(self, sim_time_s: float) -> None:
         """One callback to register with World for the whole robot.
 
+        Order per tick matters — the gripper must be teleported AFTER
+        the arm joints have moved, so it follows the up-to-date ee pose.
+        Otherwise it lags by one control tick (~33ms at 30 Hz), which
+        looks like visible jitter and drags any grasped object along
+        for the ride.
+
         Order per tick:
             1. AGV control step (advance patrol)
             2. Teleport arm base to new AGV top-centre
-            3. Teleport gripper to new arm ee pose (if gripper exists)
-            4. Arm control step (re-apply POSITION_CONTROL target)
-            5. Gripper control step (re-apply finger POSITION_CONTROL)
+            3. Arm control step (kinematic advance of joints)
+            4. Teleport gripper to fresh arm ee pose
+            5. Gripper control step (POSITION_CONTROL for fingers)
         """
         self.agv.control_step(sim_time_s)
         self._teleport_arm_to_agv()
-        if self.arm.gripper is not None:
-            self.arm.gripper.teleport_to_arm_ee()
         self.arm.control_step(sim_time_s)
         if self.arm.gripper is not None:
+            self.arm.gripper.teleport_to_arm_ee()
             self.arm.gripper.control_step(sim_time_s)
 
     # -------------------------------------------------------------- mount
@@ -136,3 +141,112 @@ class Robot:
             self.arm.body_id, base_xyz.tolist(), orn,
             physicsClientId=self.world.client_id,
         )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

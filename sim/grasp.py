@@ -214,12 +214,13 @@ class GraspCycle:
             ])
 
         elif new_state == GraspState.CLOSE:
-            self.robot.arm.gripper.close()
-            # Attach the target object to the gripper base so it stays
-            # glued through LIFT/TRANSIT/DESCEND_DROP. Kinematic arm
-            # motion means we can't count on finger friction alone
-            # holding across position discontinuities.
+            # Attach the object FIRST, then close the fingers. Doing it
+            # in this order means the object is rigidly glued to the
+            # gripper before physics-based finger closure can push it
+            # around. Visually the fingers still close on the object,
+            # but no jitter from contact resolution.
             self._create_grasp_constraint()
+            self.robot.arm.gripper.close()
 
         elif new_state == GraspState.LIFT:
             motion_targets[new_state] = np.array([
@@ -339,6 +340,22 @@ class GraspCycle:
             childFramePosition=[0, 0, 0],
             parentFrameOrientation=list(rel_orn),
             childFrameOrientation=[0, 0, 0, 1],
+            physicsClientId=cid,
+        )
+        # Make the constraint stiff so the object holds rigidly during
+        # arm motion and AGV teleport. Default maxForce is low enough
+        # that the object visibly lags behind the gripper on sudden
+        # motions.
+        p.changeConstraint(
+            self._grasp_constraint, maxForce=10000,
+            physicsClientId=cid,
+        )
+        # Zero the object's velocity so any transient momentum from
+        # finger contacts or drop-settling doesn't cause spring-back.
+        p.resetBaseVelocity(
+            self._target_object_id,
+            linearVelocity=[0, 0, 0],
+            angularVelocity=[0, 0, 0],
             physicsClientId=cid,
         )
 
