@@ -36,7 +36,6 @@ D(t) offloading decision. It gets told what object to grasp and executes.
 from __future__ import annotations
 
 import enum
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -57,11 +56,12 @@ class GraspState(enum.Enum):
     DESCEND = "descend"             # descend to grasp height
     CLOSE = "close"                 # close gripper
     LIFT = "lift"                   # lift back to approach height
-    TRANSIT = "transit"             # teleport AGV to bin B waypoint
+    TRANSIT = "transit"             # drive AGV from pick to drop waypoint
     APPROACH_DROP = "approach_drop" # move over bin B drop point
     DESCEND_DROP = "descend_drop"   # descend to release height
     OPEN = "open"                   # release
     LIFT_AWAY = "lift_away"         # retract
+    RETURN_HOME = "return_home"     # drive AGV back to pick waypoint
     DONE = "done"
     FAILED = "failed"
 
@@ -86,6 +86,9 @@ class GraspConfig:
 
     # Per-state safety timeout (seconds).
     state_timeout_s: float = 10.0
+    # Timeout for driving states (TRANSIT, RETURN_HOME). AGV crossing
+    # a 2 m gap at 0.5 m/s takes 4 s, so this needs enough headroom.
+    drive_timeout_s: float = 20.0
 
     # Time to hold after commanding gripper open/close before advancing.
     gripper_settle_s: float = 0.6
@@ -172,9 +175,15 @@ class GraspCycle:
         if self.state in (GraspState.IDLE, GraspState.DONE, GraspState.FAILED):
             return
 
-        if sim_time_s - self._state_entry_time > self.cfg.state_timeout_s:
+        # Driving states get a longer timeout because AGV cruise across
+        # the workspace takes several seconds.
+        timeout = (self.cfg.drive_timeout_s
+                   if self.state in (GraspState.TRANSIT,
+                                     GraspState.RETURN_HOME)
+                   else self.cfg.state_timeout_s)
+        if sim_time_s - self._state_entry_time > timeout:
             print(f"[grasp] TIMEOUT in state {self.state.value} "
-                  f"after {self.cfg.state_timeout_s}s")
+                  f"after {timeout}s")
             self._enter_state(GraspState.FAILED, sim_time_s)
             return
 
@@ -228,8 +237,11 @@ class GraspCycle:
             ])
 
         elif new_state == GraspState.TRANSIT:
-            drop_wp = self.robot.agv.cfg.waypoints[self.cfg.drop_wp_index]
-            self._teleport_agv_to(drop_wp.xy)
+            # Kick the AGV off its dwell so it starts moving toward the
+            # next waypoint (which is the drop waypoint in a 2-waypoint
+            # patrol). Convergence checked in _check_transition via
+            # agv.is_at_waypoint(drop_wp_index).
+            self.robot.agv.resume()
 
         elif new_state == GraspState.APPROACH_DROP:
             motion_targets[new_state] = np.array([
@@ -251,6 +263,11 @@ class GraspCycle:
             motion_targets[new_state] = np.array([
                 drop[0], drop[1], bin_b_floor_z + self.cfg.lift_height,
             ])
+
+        elif new_state == GraspState.RETURN_HOME:
+            # Drive AGV back to the pick waypoint. Same pattern as
+            # TRANSIT: kick off the dwell, wait for arrival.
+            self.robot.agv.resume()
 
         # Solve IK once (if this state moves the arm) and commit the
         # joint target. Kinematic control_step advances the arm to the
@@ -375,7 +392,7 @@ class GraspCycle:
             GraspState.LIFT: GraspState.TRANSIT,
             GraspState.APPROACH_DROP: GraspState.DESCEND_DROP,
             GraspState.DESCEND_DROP: GraspState.OPEN,
-            GraspState.LIFT_AWAY: GraspState.DONE,
+            GraspState.LIFT_AWAY: GraspState.RETURN_HOME,
         }
 
         if self.state in joint_convergence_states:
@@ -397,9 +414,17 @@ class GraspCycle:
                 self._enter_state(GraspState.LIFT_AWAY, now)
             return
 
+        # AGV-arrival-wait states: TRANSIT drives to drop, RETURN_HOME
+        # drives back to pick. Both use agv.is_at_waypoint() as the
+        # exit condition.
         if self.state == GraspState.TRANSIT:
-            if now - self._state_entry_time >= 0.5:
+            if self.robot.agv.is_at_waypoint(self.cfg.drop_wp_index):
                 self._enter_state(GraspState.APPROACH_DROP, now)
+            return
+
+        if self.state == GraspState.RETURN_HOME:
+            if self.robot.agv.is_at_waypoint(self.cfg.pick_wp_index):
+                self._enter_state(GraspState.DONE, now)
             return
 
     def _is_arm_at_joint_target(self) -> bool:
@@ -408,40 +433,6 @@ class GraspCycle:
         q_actual = self.robot.arm.get_joint_positions()
         err = float(np.max(np.abs(q_actual - self._q_target)))
         return err < self.cfg.joint_tol
-
-    # ------------------------------------------------------ utilities
-
-    def _teleport_agv_to(self, xy: tuple[float, float]) -> None:
-        """Teleport the kinematic AGV to a waypoint's xy and orient it
-        toward that waypoint's face_xy (or the next patrol waypoint)."""
-        cid = self.world.client_id
-        cfg = self.robot.agv.cfg
-        h = cfg.body_height / 2
-
-        wps = cfg.waypoints
-        cur_idx = self.cfg.drop_wp_index
-        target_wp = wps[cur_idx]
-
-        if target_wp.face_xy is not None:
-            yaw = math.atan2(
-                target_wp.face_xy[1] - xy[1],
-                target_wp.face_xy[0] - xy[0],
-            )
-        else:
-            next_idx = (cur_idx + 1) % len(wps)
-            next_wp = wps[next_idx]
-            yaw = math.atan2(
-                next_wp.xy[1] - xy[1], next_wp.xy[0] - xy[0],
-            )
-
-        orn = p.getQuaternionFromEuler([0.0, 0.0, yaw])
-        p.resetBasePositionAndOrientation(
-            self.robot.agv.body_id, [xy[0], xy[1], h], orn,
-            physicsClientId=cid,
-        )
-        self.robot.agv._current_wp = cur_idx
-        self.robot.agv._dwell_remaining = target_wp.dwell_s
-        self.robot.agv._last_step_time = None
 
     # ----------------------------------------------------- introspection
 

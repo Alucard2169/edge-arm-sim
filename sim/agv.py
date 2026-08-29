@@ -251,6 +251,19 @@ class AGV:
     def current_waypoint_index(self) -> int:
         return self._current_wp
 
+    def resume(self) -> None:
+        """End the current dwell so the AGV starts moving toward the
+        next waypoint on its next control tick. No-op if not dwelling.
+        Used by external controllers (grasp FSM) to drive the AGV on
+        command, when waypoints are configured with very large dwells."""
+        self._dwell_remaining = 0.0
+
+    def is_at_waypoint(self, idx: int) -> bool:
+        """True if the AGV has arrived at waypoint `idx` and is currently
+        dwelling there. If waypoint dwell was set to a large value, this
+        stays true until resume() is called."""
+        return self._current_wp == idx and self.is_dwelling()
+
     # ---------------------------------------------------------------- private
 
     def _get_xy(self) -> tuple[float, float]:
