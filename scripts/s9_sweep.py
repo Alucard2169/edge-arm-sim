@@ -1,25 +1,33 @@
-"""Step 9 — phase-5 evaluation sweep.
+"""Step 9 — phase-5 D(t) evaluation sweep, physics-free.
 
-Headless sweep across (initial SoC × basestation distance × decision
-variant). Each combination runs N cycles of the phase-5 adaptive grasp
-pipeline and writes one CSV row per cycle to data/sweep_results.csv.
+The physics-in-the-loop version of this sweep (previous s9) pegged the
+CPU because headless PyBullet steps as fast as the machine allows.
+This version drops PyBullet entirely: since the sweep evaluates D(t)
+decision behavior, path selection, and battery drain — all pure Python —
+the physics is control-loop context, not the object of study.
 
-Sweep dimensions (defaults, 4×4×4 = 64 runs):
-    initial SoC:      [1.0, 0.5, 0.35, 0.20]
-    basestation:      [(0,2), (0,5), (0,10), (0,20)]  # near..very-far
-    decision variant: [rule-based, always-light, always-heavy, always-offload]
+What we simulate:
+    - Battery draining across cycles
+    - Network channel varying with BS distance and shadow noise
+    - Decision looking up the rule table (or a fixed baseline)
+    - Path stubs returning latency, energy, and Bernoulli success
+    - Runner-level termination (battery depleted, max cycles)
 
-Runtime: ~15-30 minutes wall-clock for the full sweep (headless mode
-runs at max physics speed, no rendering).
+What we do NOT simulate:
+    - Actual arm/AGV motion (already verified by s7 and s8)
+    - Contact physics or grasp failure modes independent of the model's
+      predicted success. In this sweep, physical_delivery == predicted
+      success. If the model predicted the grasp would work, we count
+      the object as delivered. Honest simplification, defensible in
+      the paper: the D(t) contribution is decision quality, not
+      compensation for physical mishaps.
 
-Output: data/sweep_results.csv — one row per grasp cycle, with all
-sweep parameters denormalized into columns for easy pandas queries.
+    - Actual sim time per cycle. We track cumulative sim time as
+      (fixed_motion_time + path.latency_s) per cycle so timing
+      columns in the CSV remain meaningful for downstream plots.
 
-Analyze in a notebook:
-    df = pd.read_csv("data/sweep_results.csv")
-    df.groupby(["decision_variant", "initial_soc"])["energy_j"].sum()
-    df.groupby(["decision_variant"])["latency_s"].mean()
-    # etc.
+Runtime: full 4x4x4 = 64-run sweep at 10 cycles each = 640 cycles
+completes in about 1-2 seconds. No CPU heat.
 """
 
 from __future__ import annotations
@@ -31,8 +39,6 @@ import os
 import time
 from typing import Callable
 
-from sim.agv import AGVConfig, Waypoint
-from sim.arm import ArmConfig
 from sim.battery import Battery, BatteryConfig
 from sim.decision import (
     AlwaysLocalHeavy,
@@ -40,21 +46,29 @@ from sim.decision import (
     AlwaysOffload,
     Decision,
 )
-from sim.grasp import GraspConfig, GraspCycle
 from sim.metrics import summarize, write_cycles_csv
-from sim.multi_cycle import MultiCycleGraspRunner, RunnerConfig
 from sim.network import NetworkChannel, NetworkConfig
+from sim.outcome import CycleOutcome
 from sim.paths import (
     HeavyLocal, HeavyLocalConfig,
     LightLocal, LightLocalConfig,
     Offload, OffloadConfig,
+    Path,
 )
-from sim.robot import Robot, RobotConfig
-from sim.scene import ObjectSpec, Scene, SceneConfig
-from sim.world import World, WorldConfig
 
 
-# ------------------------------------------------------- decision factory
+# The AGV position when the D(t) decision is made. In the physics FSM,
+# INFER runs after APPROACH — the AGV is at the pick waypoint. Network
+# variation across the sweep comes from the sweep of BS positions, not
+# from AGV motion within a cycle.
+DECISION_AGV_XY: tuple[float, float] = (1.0, 0.0)
+
+# Fixed non-decision time per cycle (approach, descend, close, lift,
+# transit to bin B, drop, return home). Measured from s7 patrol grasp
+# at ~12s. Constant across all paths, so cycle_duration - fixed = the
+# D(t)-influenced portion.
+FIXED_MOTION_TIME_S: float = 12.0
+
 
 DECISION_FACTORIES: dict[str, Callable[[], Decision]] = {
     "rule-based":     Decision,
@@ -64,21 +78,61 @@ DECISION_FACTORIES: dict[str, Callable[[], Decision]] = {
 }
 
 
-# --------------------------------------------------------- scene builder
+# ------------------------------------------------------------- one cycle
 
-def make_scene_with_n_objects(n: int) -> SceneConfig:
-    """Return a SceneConfig with n varied primitive objects by cycling
-    through a small prototype list. Needed so each sweep run has enough
-    objects for max_cycles cycles without repeating IDs."""
-    prototypes = SceneConfig().objects  # default 5 varied objects
-    objs = tuple(prototypes[i % len(prototypes)] for i in range(n))
-    return SceneConfig(objects=objs)
+def simulate_cycle(
+    cycle_index: int,
+    sim_time_s: float,
+    agv_xy: tuple[float, float],
+    battery: Battery,
+    network: NetworkChannel,
+    decision: Decision,
+    paths: dict[str, Path],
+) -> CycleOutcome:
+    """One D(t) cycle without physics. Returns a CycleOutcome for the CSV."""
+    # Sample B(t) and C(t) at decision time.
+    battery_low = battery.is_low()
+    soc_at_decision = battery.state_of_charge()
+    data_rate, network_good = network.sample(agv_xy)
+
+    # Consult decision, execute chosen path.
+    path_name = decision.decide(
+        cycle=cycle_index,
+        battery_low=battery_low,
+        network_good=network_good,
+    )
+    path = paths[path_name]
+    result = path.execute(agv_xy, network)
+
+    # Drain battery.
+    battery.consume(result.energy_j)
+
+    # Fake sim-time bookkeeping.
+    started = sim_time_s
+    finished = started + FIXED_MOTION_TIME_S + result.latency_s
+
+    return CycleOutcome(
+        cycle_index=cycle_index,
+        target_object_id=cycle_index,       # synthetic id per cycle
+        final_state="done",
+        battery_low=battery_low,
+        network_good=network_good,
+        battery_soc_at_decision=soc_at_decision,
+        data_rate_bps=data_rate,
+        path_name=path_name,
+        path_result=result,
+        started_at_s=started,
+        finished_at_s=finished,
+        # Without physics, we count a cycle as delivered iff the model
+        # predicted a good grasp. See module docstring for rationale.
+        physically_delivered=result.success,
+    )
 
 
-# ------------------------------------------------------------- run helper
+# ------------------------------------------------------- one full run
 
 def _stable_seed(text: str) -> int:
-    """Deterministic seed from a string. 32-bit range for numpy."""
+    """Deterministic seed from a string, 32-bit range for numpy."""
     return int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
 
 
@@ -87,74 +141,43 @@ def run_one(
     initial_soc: float,
     basestation_xy: tuple[float, float],
     n_cycles: int,
-) -> tuple[list, dict]:
-    """Set up and run one sweep combination. Returns (outcomes, summary)."""
+) -> list[CycleOutcome]:
+    """Set up modules for one sweep row and run up to n_cycles."""
     seed = _stable_seed(f"{decision_variant}|{initial_soc}|{basestation_xy}")
 
-    world = World(WorldConfig(gui=False))
-    world.reset()
-
-    scene_cfg = make_scene_with_n_objects(n_cycles)
-    bin_a_xy = scene_cfg.bin_a.center_xy
-    bin_b_xy = scene_cfg.bin_b.center_xy
-
-    robot_cfg = RobotConfig(
-        agv=AGVConfig(
-            cruise_speed=0.5,
-            waypoints=(
-                Waypoint(xy=(1.0, 0.0),  dwell_s=1e9, face_xy=bin_a_xy),
-                Waypoint(xy=(-1.0, 0.0), dwell_s=1e9, face_xy=bin_b_xy),
-            ),
-        ),
-        arm=ArmConfig(with_gripper=True),
-    )
-    robot = Robot(world, robot_cfg)
-    robot.reset()
-
-    scene = Scene(world, scene_cfg)
-    scene.reset()
-
-    # Demo-scale battery so drain shows up in n_cycles.
     battery = Battery(BatteryConfig(
         capacity_j=15.0,
         soc_initial=initial_soc,
         soc_low_threshold=0.30,
     ))
-
     network = NetworkChannel(NetworkConfig(
         basestation_xy=basestation_xy,
         seed=seed,
     ))
-
     decision = DECISION_FACTORIES[decision_variant]()
-
-    # Path stubs — seed each so a run's success/latency samples are
-    # reproducible for the (variant, soc, bs) triple.
     paths = {
         "light-local": LightLocal(LightLocalConfig(seed=seed + 1)),
         "heavy-local": HeavyLocal(HeavyLocalConfig(seed=seed + 2)),
         "offload":     Offload(OffloadConfig(seed=seed + 3)),
     }
 
-    grasp = GraspCycle(world, robot, scene, GraspConfig(),
-                       battery=battery, network=network,
-                       decision=decision, paths=paths)
-    runner = MultiCycleGraspRunner(world, grasp, RunnerConfig(
-        max_cycles=n_cycles,
-        inter_cycle_pause_s=0.1,   # tighter than the GUI demo
-    ))
-
-    world.register_callback(rate_hz=30.0, fn=robot.step_callback)
-    world.register_callback(rate_hz=30.0, fn=grasp.tick)
-    world.register_callback(rate_hz=30.0, fn=runner.tick)
-
-    runner.start()
-    # Generous ceiling: 60 s per cycle should cover any offload-far
-    # latency spike. Actual runtime is bounded by should_stop.
-    world.run(duration_s=60.0 * n_cycles, should_stop=runner.is_stopped)
-    world.close()
-
-    return runner.outcomes, summarize(runner.outcomes)
+    outcomes: list[CycleOutcome] = []
+    sim_time_s = 0.0
+    for cycle_index in range(n_cycles):
+        if battery.is_depleted():
+            break
+        oc = simulate_cycle(
+            cycle_index=cycle_index,
+            sim_time_s=sim_time_s,
+            agv_xy=DECISION_AGV_XY,
+            battery=battery,
+            network=network,
+            decision=decision,
+            paths=paths,
+        )
+        outcomes.append(oc)
+        sim_time_s = oc.finished_at_s
+    return outcomes
 
 
 # ------------------------------------------------------------------ main
@@ -164,7 +187,7 @@ def main() -> None:
     parser.add_argument("--output", default="data/sweep_results.csv",
                         help="output CSV filepath")
     parser.add_argument("--cycles", type=int, default=10,
-                        help="cycles per run")
+                        help="max cycles per run (may end early on battery depletion)")
     parser.add_argument("--quick", action="store_true",
                         help="tiny sweep for a smoke test (8 runs)")
     args = parser.parse_args()
@@ -180,25 +203,22 @@ def main() -> None:
 
     combos = list(itertools.product(decisions, soc_values, bs_positions))
 
-    # Truncate the output file at start (fresh sweep).
+    # Truncate the output at start (fresh sweep).
     if os.path.exists(args.output):
         os.remove(args.output)
-    print(f"Sweeping {len(combos)} combinations, {args.cycles} cycles each")
+    print(f"Sweeping {len(combos)} combinations, up to {args.cycles} cycles each")
     print(f"Output: {args.output}")
     print("=" * 78)
 
     t0 = time.perf_counter()
     for i, (decision_variant, soc, bs_xy) in enumerate(combos, 1):
         run_id = f"{decision_variant}_soc{soc:.2f}_bs{bs_xy[0]:.0f},{bs_xy[1]:.0f}"
-        print(f"[{i:3d}/{len(combos)}] {run_id}")
-
-        outcomes, summary = run_one(
+        outcomes = run_one(
             decision_variant=decision_variant,
             initial_soc=soc,
             basestation_xy=bs_xy,
             n_cycles=args.cycles,
         )
-
         n_written = write_cycles_csv(
             outcomes,
             filepath=args.output,
@@ -210,17 +230,18 @@ def main() -> None:
                 "basestation_y": bs_xy[1],
             },
         )
-        pc = summary["path_counts"]
-        print(f"          -> {n_written:2d} cycles  "
-              f"paths: L={pc.get('light-local', 0):2d} "
+        s = summarize(outcomes)
+        pc = s["path_counts"]
+        print(f"[{i:3d}/{len(combos)}] {run_id:<45s}  "
+              f"cyc={n_written:2d}  "
+              f"L={pc.get('light-local', 0):2d} "
               f"H={pc.get('heavy-local', 0):2d} "
               f"O={pc.get('offload', 0):2d}  "
-              f"E={summary['total_energy_j']:6.3f}J  "
-              f"delivery={summary['physical_delivery_rate'] * 100:.0f}%")
-
+              f"E={s['total_energy_j']:6.3f}J  "
+              f"deliv={s['physical_delivery_rate'] * 100:3.0f}%")
     t1 = time.perf_counter()
     print("=" * 78)
-    print(f"Sweep complete: {len(combos)} runs in {t1 - t0:.1f}s wall-clock")
+    print(f"Sweep complete: {len(combos)} runs in {t1 - t0:.2f}s wall-clock")
     print(f"Output: {args.output}")
 
 

@@ -46,6 +46,7 @@ from sim.battery import Battery
 from sim.decision import Decision
 from sim.gripper import GRIPPER_FINGERTIP_Z_OFFSET
 from sim.network import NetworkChannel
+from sim.outcome import CycleOutcome
 from sim.paths import HeavyLocal, LightLocal, Offload, Path, PathResult
 from sim.robot import Robot
 from sim.scene import Scene
@@ -103,33 +104,8 @@ class GraspConfig:
     drop_wp_index: int = 1
 
 
-# --------------------------------------------------------------- outcome
-
-@dataclass
-class CycleOutcome:
-    """Per-cycle metric bundle produced when a GraspCycle completes.
-
-    Aggregated by MultiCycleGraspRunner and consumed by the CSV logger
-    in commit 5. `path_result` is the raw PathResult from the chosen
-    execution path; the other fields are the FSM-level bookkeeping
-    (which object, wall-clock start/end, final state)."""
-
-    cycle_index: int
-    target_object_id: int
-    final_state: str                # GraspState.value at end
-    # D(t) inputs at the moment of the decision.
-    battery_low: bool = False
-    network_good: bool = False
-    battery_soc_at_decision: float = 0.0
-    data_rate_bps: float = 0.0
-    # Path chosen and what it produced.
-    path_name: str = ""
-    path_result: Optional[PathResult] = None
-    # Wall-clock timing (sim seconds).
-    started_at_s: float = 0.0
-    finished_at_s: float = 0.0
-    # Was the object physically placed in bin B?
-    physically_delivered: bool = False
+# CycleOutcome now lives in sim.outcome so pure-Python consumers
+# (metrics logger, headless sweep) don't need to import pybullet.
 
 
 # --------------------------------------------------------------- FSM class

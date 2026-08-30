@@ -37,7 +37,7 @@ import os
 from collections import Counter
 from typing import Any, Iterable
 
-from sim.grasp import CycleOutcome
+from sim.outcome import CycleOutcome
 
 
 # Fixed column order so multi-run appends keep the same schema.
