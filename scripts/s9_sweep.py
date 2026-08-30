@@ -26,8 +26,18 @@ What we do NOT simulate:
       (fixed_motion_time + path.latency_s) per cycle so timing
       columns in the CSV remain meaningful for downstream plots.
 
+Seeding (multi-seed sweeps):
+    Each seed_idx k induces a fully-specified "world":
+    a network shadow-fading trace and per-path Bernoulli streams.
+    Every variant at (soc, bs, seed_idx=k) samples from the same
+    streams, so between-variant comparisons are paired and have
+    tighter CIs than independent seeds would give. Pairing on path
+    streams is per-invocation, not per-cycle — i.e., the N-th call
+    to LightLocal is deterministic across variants regardless of
+    which cycle number invokes it.
+
 Runtime: full 4x4x4 = 64-run sweep at 10 cycles each = 640 cycles
-completes in about 1-2 seconds. No CPU heat.
+completes in about 1-2 seconds. --seeds 30 scales linearly (~30-60s).
 """
 
 from __future__ import annotations
@@ -141,9 +151,13 @@ def run_one(
     initial_soc: float,
     basestation_xy: tuple[float, float],
     n_cycles: int,
+    seed_idx: int,                                          # NEW
 ) -> list[CycleOutcome]:
     """Set up modules for one sweep row and run up to n_cycles."""
-    seed = _stable_seed(f"{decision_variant}|{initial_soc}|{basestation_xy}")
+    # CHANGED: seed derivation excludes variant so that all variants at
+    # the same (soc, bs, seed_idx) see identical network/path streams.
+    # This makes between-variant comparisons paired and low-variance.
+    seed = _stable_seed(f"{initial_soc}|{basestation_xy}|{seed_idx}")
 
     battery = Battery(BatteryConfig(
         capacity_j=15.0,
@@ -188,8 +202,11 @@ def main() -> None:
                         help="output CSV filepath")
     parser.add_argument("--cycles", type=int, default=10,
                         help="max cycles per run (may end early on battery depletion)")
+    parser.add_argument("--seeds", type=int, default=1,                 # NEW
+                        help="number of seeds per (variant, scenario) combination "
+                             "(default 1 preserves single-seed behavior)")
     parser.add_argument("--quick", action="store_true",
-                        help="tiny sweep for a smoke test (8 runs)")
+                        help="tiny sweep for a smoke test (8 runs per seed)")
     args = parser.parse_args()
 
     if args.quick:
@@ -201,23 +218,33 @@ def main() -> None:
         bs_positions = [(0.0, 2.0), (0.0, 5.0), (0.0, 10.0), (0.0, 20.0)]
         decisions = ["rule-based", "always-light", "always-heavy", "always-offload"]
 
-    combos = list(itertools.product(decisions, soc_values, bs_positions))
+    # CHANGED: seed_idx is the OUTER loop so partial runs still cover
+    # every scenario for the seeds that completed.
+    combos = list(itertools.product(
+        range(args.seeds), decisions, soc_values, bs_positions,
+    ))
 
     # Truncate the output at start (fresh sweep).
     if os.path.exists(args.output):
         os.remove(args.output)
-    print(f"Sweeping {len(combos)} combinations, up to {args.cycles} cycles each")
+    print(f"Sweeping {len(combos)} combinations "
+          f"({args.seeds} seed(s) × {len(decisions)} variants × "
+          f"{len(soc_values)} SoCs × {len(bs_positions)} BS positions), "
+          f"up to {args.cycles} cycles each")
     print(f"Output: {args.output}")
     print("=" * 78)
 
     t0 = time.perf_counter()
-    for i, (decision_variant, soc, bs_xy) in enumerate(combos, 1):
-        run_id = f"{decision_variant}_soc{soc:.2f}_bs{bs_xy[0]:.0f},{bs_xy[1]:.0f}"
+    for i, (seed_idx, decision_variant, soc, bs_xy) in enumerate(combos, 1):
+        run_id = (f"{decision_variant}_soc{soc:.2f}"
+                  f"_bs{bs_xy[0]:.0f},{bs_xy[1]:.0f}"
+                  f"_seed{seed_idx}")                       # CHANGED
         outcomes = run_one(
             decision_variant=decision_variant,
             initial_soc=soc,
             basestation_xy=bs_xy,
             n_cycles=args.cycles,
+            seed_idx=seed_idx,                              # NEW
         )
         n_written = write_cycles_csv(
             outcomes,
@@ -228,11 +255,12 @@ def main() -> None:
                 "initial_soc": soc,
                 "basestation_x": bs_xy[0],
                 "basestation_y": bs_xy[1],
+                "seed": seed_idx,                           # NEW
             },
         )
         s = summarize(outcomes)
         pc = s["path_counts"]
-        print(f"[{i:3d}/{len(combos)}] {run_id:<45s}  "
+        print(f"[{i:4d}/{len(combos)}] {run_id:<55s}  "
               f"cyc={n_written:2d}  "
               f"L={pc.get('light-local', 0):2d} "
               f"H={pc.get('heavy-local', 0):2d} "

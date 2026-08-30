@@ -62,6 +62,7 @@ _CSV_FIELDS = [
     "initial_soc",
     "basestation_x",
     "basestation_y",
+    "seed",
 ]
 
 
@@ -94,6 +95,7 @@ def _outcome_to_row(
         "initial_soc": run_params.get("initial_soc", 0.0),
         "basestation_x": run_params.get("basestation_x", 0.0),
         "basestation_y": run_params.get("basestation_y", 0.0),
+        "seed": run_params.get("seed", 0),
     }
 
 
