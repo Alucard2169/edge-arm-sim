@@ -163,9 +163,18 @@ class World:
         p.stepSimulation(physicsClientId=self.client_id)
         self._step_count += 1
 
-    def run(self, duration_s: float | None = None) -> None:
+    def run(
+        self,
+        duration_s: float | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
         """Run the tick loop. If `duration_s` is None, run until the GUI
         window is closed (or forever in headless mode -- don't do that).
+
+        `should_stop`, if given, is polled each tick after step(); the
+        loop exits as soon as it returns True. Used by headless sweeps
+        so we don't waste sim time after the MultiCycleGraspRunner
+        signals completion.
         """
         if duration_s is None and not self.cfg.gui:
             raise ValueError(
@@ -186,6 +195,8 @@ class World:
                     break
                 if self.cfg.gui and not p.isConnected(self.client_id):
                     break  # user closed the window
+                if should_stop is not None and should_stop():
+                    break
 
                 self.step()
 
